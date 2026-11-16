@@ -352,6 +352,7 @@ class HTTP11ConnectionByteStream:
         self._connection = connection
         self._request = request
         self._closed = False
+        self._close_lock = Lock()
 
     def __iter__(self) -> typing.Iterator[bytes]:
         kwargs = {"request": self._request}
@@ -368,10 +369,11 @@ class HTTP11ConnectionByteStream:
             raise exc
 
     def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            with Trace("response_closed", logger, self._request):
-                self._connection._response_closed()
+        with self._close_lock:
+            if not self._closed:
+                with Trace("response_closed", logger, self._request):
+                    self._connection._response_closed()
+                self._closed = True
 
 
 class HTTP11UpgradeStream(NetworkStream):

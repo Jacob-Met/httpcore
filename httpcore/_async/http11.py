@@ -352,6 +352,7 @@ class HTTP11ConnectionByteStream:
         self._connection = connection
         self._request = request
         self._closed = False
+        self._close_lock = AsyncLock()
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
         kwargs = {"request": self._request}
@@ -368,10 +369,11 @@ class HTTP11ConnectionByteStream:
             raise exc
 
     async def aclose(self) -> None:
-        if not self._closed:
-            self._closed = True
-            async with Trace("response_closed", logger, self._request):
-                await self._connection._response_closed()
+        async with self._close_lock:
+            if not self._closed:
+                async with Trace("response_closed", logger, self._request):
+                    await self._connection._response_closed()
+                self._closed = True
 
 
 class AsyncHTTP11UpgradeStream(AsyncNetworkStream):
