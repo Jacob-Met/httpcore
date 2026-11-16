@@ -145,7 +145,8 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             kwargs: dict[str, typing.Any] = {"request": request}
             async with Trace("send_request_headers", logger, request, kwargs):
                 stream_id = await self._send_request_headers(request=request)
-            kwargs["stream_id"] = stream_id
+                kwargs["stream_id"] = stream_id
+                await self._write_outgoing_data(request)
 
             async with Trace("send_request_body", logger, request, kwargs):
                 await self._send_request_body(request=request, stream_id=stream_id)
@@ -168,8 +169,12 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 },
             )
         except BaseException as exc:  # noqa: PIE786
-            if stream_id is not None:
-                with AsyncShieldCancellation():
+            with AsyncShieldCancellation():
+                if stream_id is None:
+                    # An error before stream allocation must release the permit.
+                    await self._max_streams_semaphore.release()
+                    self._request_count -= 1
+                else:
                     response_closed_kwargs = {"stream_id": stream_id}
                     async with Trace(
                         "response_closed", logger, request, response_closed_kwargs
@@ -260,13 +265,17 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                 self._events[stream_id] = []
             except h2.exceptions.NoAvailableStreamIDError:  # pragma: nocover
                 self._used_all_stream_ids = True
-                self._request_count -= 1
                 raise ConnectionNotAvailable()
 
-            self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
-            self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+            try:
+                self._h2_state.send_headers(stream_id, headers, end_stream=end_stream)
+                self._h2_state.increment_flow_control_window(2**24, stream_id=stream_id)
+            except BaseException:
+                # The caller has not received stream_id yet; do not retain
+                # an orphaned event entry when a header fails to encode.
+                self._events.pop(stream_id, None)
+                raise
 
-        await self._write_outgoing_data(request)
         return stream_id
 
     async def _send_request_body(self, request: Request, stream_id: int) -> None:
