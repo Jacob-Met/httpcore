@@ -32,7 +32,10 @@ class MockStream(NetworkStream):
             raise ReadError("Connection closed")
         if not self._buffer:
             return b""
-        return self._buffer.pop(0)
+        data = self._buffer.pop(0)
+        if len(data) > max_bytes:
+            self._buffer.insert(0, data[max_bytes:])
+        return data[:max_bytes]
 
     def write(self, buffer: bytes, timeout: float | None = None) -> None:
         pass
@@ -93,7 +96,10 @@ class AsyncMockStream(AsyncNetworkStream):
             raise ReadError("Connection closed")
         if not self._buffer:
             return b""
-        return self._buffer.pop(0)
+        data = self._buffer.pop(0)
+        if len(data) > max_bytes:
+            self._buffer.insert(0, data[max_bytes:])
+        return data[:max_bytes]
 
     async def write(self, buffer: bytes, timeout: float | None = None) -> None:
         pass

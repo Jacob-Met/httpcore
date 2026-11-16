@@ -39,6 +39,33 @@ REPLY_CODES = {
 }
 
 
+async def _read_socks5_bytes(stream: AsyncNetworkStream, size: int) -> bytes:
+    """Read a complete SOCKS5 reply segment, even across TCP read boundaries."""
+    chunks = []
+    while size:
+        data = await stream.read(max_bytes=size)
+        if not data:
+            raise ProxyError("SOCKS5 proxy closed connection during handshake.")
+        chunks.append(data)
+        size -= len(data)
+    return b"".join(chunks)
+
+
+async def _read_socks5_connect_reply(stream: AsyncNetworkStream) -> bytes:
+    header = await _read_socks5_bytes(stream, 4)
+    address_type = header[3]
+    if address_type == 1:  # IPv4
+        address_length = 4
+    elif address_type == 4:  # IPv6
+        address_length = 16
+    elif address_type == 3:  # Domain name
+        length = await _read_socks5_bytes(stream, 1)
+        return header + length + await _read_socks5_bytes(stream, length[0] + 2)
+    else:
+        raise ProxyError("SOCKS5 proxy returned an invalid address type.")
+    return header + await _read_socks5_bytes(stream, address_length + 2)
+
+
 async def _init_socks5_connection(
     stream: AsyncNetworkStream,
     *,
@@ -59,7 +86,7 @@ async def _init_socks5_connection(
     await stream.write(outgoing_bytes)
 
     # Auth method response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await _read_socks5_bytes(stream, 2)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5AuthReply)
     if response.method != auth_method:
@@ -78,7 +105,7 @@ async def _init_socks5_connection(
         await stream.write(outgoing_bytes)
 
         # Username/password response
-        incoming_bytes = await stream.read(max_bytes=4096)
+        incoming_bytes = await _read_socks5_bytes(stream, 2)
         response = conn.receive_data(incoming_bytes)
         assert isinstance(response, socksio.socks5.SOCKS5UsernamePasswordReply)
         if not response.success:
@@ -94,7 +121,7 @@ async def _init_socks5_connection(
     await stream.write(outgoing_bytes)
 
     # Connect response
-    incoming_bytes = await stream.read(max_bytes=4096)
+    incoming_bytes = await _read_socks5_connect_reply(stream)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5Reply)
     if response.reply_code != socksio.socks5.SOCKS5ReplyCode.SUCCEEDED:

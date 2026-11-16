@@ -3,7 +3,6 @@ import pytest
 import httpcore
 
 
-
 def test_socks5_request():
     """
     Send an HTTP request via a SOCKS proxy.
@@ -195,3 +194,71 @@ def test_socks5_request_incorrect_auth():
         assert str(exc_info.value) == "Invalid username/password"
 
         assert not proxy.connections
+
+
+@pytest.mark.parametrize("auth", [None, (b"user", b"pass")])
+def test_socks5_fragmented_handshake(auth):
+    # A TCP read is not guaranteed to return a complete SOCKS5 reply.
+    chunks = [b"\x05", b"\x02" if auth else b"\x00"]
+    if auth:
+        chunks.extend([b"\x01", b"\x00"])
+    chunks.extend([
+        b"\x05", b"\x00", b"\x00", b"\x01",
+        b"\x7f\x00", b"\x00", b"\x01\x00\x50",
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok",
+    ])
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:8080/", auth=auth),
+        network_backend=httpcore.MockBackend(chunks),
+    ) as pool:
+        response = pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"ok"
+
+
+def test_socks5_truncated_handshake_is_proxy_error():
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:8080/"),
+        network_backend=httpcore.MockBackend([b"\x05"]),
+    ) as pool:
+        with pytest.raises(httpcore.ProxyError, match="SOCKS5"):
+            pool.request("GET", "http://example.com/")
+        assert not pool.connections
+
+
+@pytest.mark.parametrize(
+    "reply_chunks",
+    [
+        [b"\x05\x00\x00\x01", b"\x7f", b"\x00\x00\x01", b"\x00\x50"],
+        [b"\x05\x00\x00\x03", b"\x0b", b"example.com", b"\x00\x50"],
+        [b"\x05\x00\x00\x04", bytes(range(16)), b"\x00\x50"],
+    ],
+)
+def test_socks5_connect_reply_address_types(reply_chunks):
+    # CONNECT replies have variable address lengths (IPv4, domain and IPv6).
+    chunks = [b"\x05\x00", *reply_chunks, b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"]
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:8080/"),
+        network_backend=httpcore.MockBackend(chunks),
+    ) as pool:
+        response = pool.request("GET", "http://example.com/")
+        assert response.status == 200
+        assert response.content == b"ok"
+
+
+@pytest.mark.parametrize(
+    "partial_reply",
+    [
+        [b"\x05\x00", b"\x05\x00\x00\x01", b"\x7f"],
+        [b"\x05\x00", b"\x05\x00\x00\x03"],
+        [b"\x05\x00", b"\x05\x00\x00\x04", b"\x00" * 10],
+    ],
+)
+def test_socks5_truncated_connect_reply(partial_reply):
+    with httpcore.ConnectionPool(
+        proxy=httpcore.Proxy("socks5://localhost:8080/"),
+        network_backend=httpcore.MockBackend(partial_reply),
+    ) as pool:
+        with pytest.raises(httpcore.ProxyError, match="SOCKS5"):
+            pool.request("GET", "http://example.com/")
+        assert not pool.connections

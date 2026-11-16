@@ -5,8 +5,8 @@ import ssl
 
 import socksio
 
-from .._backends.sync import SyncBackend
 from .._backends.base import NetworkBackend, NetworkStream
+from .._backends.sync import SyncBackend
 from .._exceptions import ConnectionNotAvailable, ProxyError
 from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
@@ -39,6 +39,33 @@ REPLY_CODES = {
 }
 
 
+def _read_socks5_bytes(stream: NetworkStream, size: int) -> bytes:
+    """Read a complete SOCKS5 reply segment, even across TCP read boundaries."""
+    chunks = []
+    while size:
+        data = stream.read(max_bytes=size)
+        if not data:
+            raise ProxyError("SOCKS5 proxy closed connection during handshake.")
+        chunks.append(data)
+        size -= len(data)
+    return b"".join(chunks)
+
+
+def _read_socks5_connect_reply(stream: NetworkStream) -> bytes:
+    header = _read_socks5_bytes(stream, 4)
+    address_type = header[3]
+    if address_type == 1:  # IPv4
+        address_length = 4
+    elif address_type == 4:  # IPv6
+        address_length = 16
+    elif address_type == 3:  # Domain name
+        length = _read_socks5_bytes(stream, 1)
+        return header + length + _read_socks5_bytes(stream, length[0] + 2)
+    else:
+        raise ProxyError("SOCKS5 proxy returned an invalid address type.")
+    return header + _read_socks5_bytes(stream, address_length + 2)
+
+
 def _init_socks5_connection(
     stream: NetworkStream,
     *,
@@ -59,7 +86,7 @@ def _init_socks5_connection(
     stream.write(outgoing_bytes)
 
     # Auth method response
-    incoming_bytes = stream.read(max_bytes=4096)
+    incoming_bytes = _read_socks5_bytes(stream, 2)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5AuthReply)
     if response.method != auth_method:
@@ -78,7 +105,7 @@ def _init_socks5_connection(
         stream.write(outgoing_bytes)
 
         # Username/password response
-        incoming_bytes = stream.read(max_bytes=4096)
+        incoming_bytes = _read_socks5_bytes(stream, 2)
         response = conn.receive_data(incoming_bytes)
         assert isinstance(response, socksio.socks5.SOCKS5UsernamePasswordReply)
         if not response.success:
@@ -94,7 +121,7 @@ def _init_socks5_connection(
     stream.write(outgoing_bytes)
 
     # Connect response
-    incoming_bytes = stream.read(max_bytes=4096)
+    incoming_bytes = _read_socks5_connect_reply(stream)
     response = conn.receive_data(incoming_bytes)
     assert isinstance(response, socksio.socks5.SOCKS5Reply)
     if response.reply_code != socksio.socks5.SOCKS5ReplyCode.SUCCEEDED:
