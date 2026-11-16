@@ -914,3 +914,45 @@ async def test_idle_socket_probe_only_on_reuse(server_disconnected):
     else:
         assert closing == []
         assert pool_request.connection is candidate
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("multiplexing", [False, True])
+async def test_idle_connection_assignment_respects_multiplexing(multiplexing):
+    """A queued HTTP/1.1 connection has one claimant; HTTP/2 can share it."""
+    from httpcore._async.connection_pool import AsyncPoolRequest
+
+    pool = httpcore.AsyncConnectionPool(max_connections=2)
+    connection = Mock()
+    connection.is_idle.return_value = True
+    connection.is_closed.return_value = False
+    connection.has_expired.return_value = False
+    connection.is_available.return_value = True
+    connection.is_multiplexing.return_value = multiplexing
+    connection.can_handle_request.return_value = True
+    pool._connections = [connection]
+    first = AsyncPoolRequest(httpcore.Request("GET", "http://example.com/"))
+    second = AsyncPoolRequest(httpcore.Request("GET", "http://example.com/"))
+    pool._requests.extend([first, second])
+
+    assert pool._assign_requests_to_connections() == []
+    assert first.connection is connection
+    assert (second.connection is connection) == multiplexing
+    assert second.connection is not None
+
+
+def test_multiplexing_trait_tracks_negotiated_protocol():
+    from httpcore._async.connection import AsyncHTTPConnection
+    from httpcore._async.http2 import AsyncHTTP2Connection
+    from httpcore._async.http11 import AsyncHTTP11Connection
+    from httpcore._backends.mock import AsyncMockStream
+
+    origin = httpcore.URL('https://example.com').origin
+    connection = AsyncHTTPConnection(origin=origin, http2=True)
+    assert not connection.is_multiplexing()
+    connection._connection = AsyncHTTP2Connection(
+        origin=origin, stream=AsyncMockStream([], http2=True)
+    )
+    assert connection.is_multiplexing()
+    connection._connection = AsyncHTTP11Connection(origin=origin, stream=AsyncMockStream([]))
+    assert not connection.is_multiplexing()

@@ -905,3 +905,42 @@ def test_idle_socket_probe_only_on_reuse():
     assert candidate in closing
     assert candidate not in pool.connections
     assert pool_request.connection is not candidate
+
+
+@pytest.mark.parametrize("multiplexing", [False, True])
+def test_idle_connection_assignment_respects_multiplexing(multiplexing):
+    """A queued HTTP/1.1 connection has one claimant; HTTP/2 can share it."""
+    from httpcore._sync.connection_pool import PoolRequest
+
+    pool = httpcore.ConnectionPool(max_connections=2)
+    connection = Mock()
+    connection.is_idle.return_value = True
+    connection.is_closed.return_value = False
+    connection.has_expired.return_value = False
+    connection.is_available.return_value = True
+    connection.is_multiplexing.return_value = multiplexing
+    connection.can_handle_request.return_value = True
+    pool._connections = [connection]
+    first = PoolRequest(httpcore.Request("GET", "http://example.com/"))
+    second = PoolRequest(httpcore.Request("GET", "http://example.com/"))
+    pool._requests.extend([first, second])
+
+    assert pool._assign_requests_to_connections() == []
+    assert first.connection is connection
+    assert (second.connection is connection) == multiplexing
+    assert second.connection is not None
+
+
+def test_multiplexing_trait_tracks_negotiated_protocol():
+    from httpcore._backends.mock import MockStream
+    from httpcore._sync.connection import HTTPConnection
+    from httpcore._sync.http2 import HTTP2Connection
+    from httpcore._sync.http11 import HTTP11Connection
+
+    origin = httpcore.URL('https://example.com').origin
+    connection = HTTPConnection(origin=origin, http2=True)
+    assert not connection.is_multiplexing()
+    connection._connection = HTTP2Connection(origin=origin, stream=MockStream([], http2=True))
+    assert connection.is_multiplexing()
+    connection._connection = HTTP11Connection(origin=origin, stream=MockStream([]))
+    assert not connection.is_multiplexing()
