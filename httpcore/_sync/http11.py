@@ -13,6 +13,7 @@ from .._backends.base import NetworkStream
 from .._exceptions import (
     ConnectionNotAvailable,
     LocalProtocolError,
+    ReadError,
     RemoteProtocolError,
     WriteError,
     map_exceptions,
@@ -23,6 +24,8 @@ from .._trace import Trace
 from .interfaces import ConnectionInterface
 
 logger = logging.getLogger("httpcore.http11")
+
+_DISCONNECTED_WITHOUT_RESPONSE = "Server disconnected without sending a response."
 
 
 # A subset of `h11.Event` types supported by `_send_event`
@@ -77,6 +80,8 @@ class HTTP11Connection(ConnectionInterface):
             else:
                 raise ConnectionNotAvailable()
 
+        body_is_empty = False
+        body_not_started = True
         try:
             kwargs = {"request": request}
             try:
@@ -85,7 +90,8 @@ class HTTP11Connection(ConnectionInterface):
                 ) as trace:
                     self._send_request_headers(**kwargs)
                 with Trace("send_request_body", logger, request, kwargs) as trace:
-                    self._send_request_body(**kwargs)
+                    body_not_started = False
+                    body_is_empty = self._send_request_body(**kwargs)
             except WriteError:
                 # If we get a write error while we're writing the request,
                 # then we supress this error and move on to attempting to
@@ -133,6 +139,22 @@ class HTTP11Connection(ConnectionInterface):
             with ShieldCancellation():
                 with Trace("response_closed", logger, request) as trace:
                     self._response_closed()
+            # A keep-alive socket can close after the pool's readiness probe.
+            # A GET/HEAD with no consumed request body is replayable; let the pool
+            # retire the stale socket before assigning a fresh connection.
+            if (
+                (body_is_empty or body_not_started)
+                and self._request_count > 1
+                and request.method in (b"GET", b"HEAD")
+                and (
+                    isinstance(exc, ReadError)
+                    or (
+                        isinstance(exc, RemoteProtocolError)
+                        and str(exc) == _DISCONNECTED_WITHOUT_RESPONSE
+                    )
+                )
+            ):
+                raise ConnectionNotAvailable() from exc
             raise exc
 
     # Sending the request...
@@ -149,16 +171,20 @@ class HTTP11Connection(ConnectionInterface):
             )
         self._send_event(event, timeout=timeout)
 
-    def _send_request_body(self, request: Request) -> None:
+    def _send_request_body(self, request: Request) -> bool:
         timeouts = request.extensions.get("timeout", {})
         timeout = timeouts.get("write", None)
 
         assert isinstance(request.stream, typing.Iterable)
+        body_is_empty = True
         for chunk in request.stream:
+            if chunk:
+                body_is_empty = False
             event = h11.Data(data=chunk)
             self._send_event(event, timeout=timeout)
 
         self._send_event(h11.EndOfMessage(), timeout=timeout)
+        return body_is_empty
 
     def _send_event(self, event: h11.Event, timeout: float | None = None) -> None:
         bytes_to_send = self._h11_state.send(event)
@@ -227,7 +253,7 @@ class HTTP11Connection(ConnectionInterface):
                 # perspective. Instead we handle this case distinctly and treat
                 # it as a ConnectError.
                 if data == b"" and self._h11_state.their_state == h11.SEND_RESPONSE:
-                    msg = "Server disconnected without sending a response."
+                    msg = _DISCONNECTED_WITHOUT_RESPONSE
                     raise RemoteProtocolError(msg)
 
                 self._h11_state.receive_data(data)

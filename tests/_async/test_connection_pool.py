@@ -956,3 +956,70 @@ def test_multiplexing_trait_tracks_negotiated_protocol():
     assert connection.is_multiplexing()
     connection._connection = AsyncHTTP11Connection(origin=origin, stream=AsyncMockStream([]))
     assert not connection.is_multiplexing()
+
+
+@pytest.mark.anyio
+async def test_retry_reused_socket_closed_before_response_for_bodyless_get():
+    network_backend = httpcore.AsyncMockBackend(
+        [b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"\r\n", b"ok"]
+    )
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+        assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+
+
+@pytest.mark.anyio
+async def test_do_not_retry_reused_socket_for_unsafe_or_body_request():
+    for method, content in [("POST", None), ("GET", b"important data")]:
+        network_backend = httpcore.AsyncMockBackend(
+            [b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"\r\n", b"ok"]
+        )
+        async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+            assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+            with pytest.raises(httpcore.RemoteProtocolError):
+                await pool.request(method, "http://example.com/", content=content)
+
+
+@pytest.mark.anyio
+async def test_retry_reused_socket_read_failure_before_response():
+    class FailingStream(httpcore.AsyncMockStream):
+        async def read(self, max_bytes, timeout=None):
+            if not self._buffer:
+                raise httpcore.ReadError("socket closed before response")
+            return await super().read(max_bytes, timeout)
+
+    class Backend(httpcore.AsyncMockBackend):
+        async def connect_tcp(self, *args, **kwargs):
+            return FailingStream(list(self._buffer))
+
+    network_backend = Backend(
+        [b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"\r\n", b"ok"]
+    )
+    async with httpcore.AsyncConnectionPool(network_backend=network_backend) as pool:
+        assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+        assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("method,content,retry", [
+    ("GET", None, True), ("GET", b"payload", True), ("POST", None, False)
+])
+async def test_reused_socket_closes_during_request_headers(method, content, retry):
+    class FailingStream(httpcore.AsyncMockStream):
+        async def write(self, buffer, timeout=None):
+            if not self._buffer:
+                raise httpcore.WriteError("socket closed during request headers")
+            return await super().write(buffer, timeout)
+
+    class Backend(httpcore.AsyncMockBackend):
+        async def connect_tcp(self, *args, **kwargs):
+            return FailingStream(list(self._buffer))
+
+    backend = Backend([b"HTTP/1.1 200 OK\r\n", b"Content-Length: 2\r\n", b"\r\n", b"ok"])
+    async with httpcore.AsyncConnectionPool(network_backend=backend) as pool:
+        assert (await pool.request("GET", "http://example.com/")).content == b"ok"
+        if retry:
+            assert (await pool.request(method, "http://example.com/", content=content)).content == b"ok"
+        else:
+            with pytest.raises(httpcore.RemoteProtocolError):
+                await pool.request(method, "http://example.com/", content=content)
