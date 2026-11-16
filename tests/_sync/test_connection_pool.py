@@ -1,13 +1,13 @@
 import logging
 import typing
+from unittest.mock import Mock
 
 import hpack
 import hyperframe.frame
 import pytest
-from tests import concurrency
 
 import httpcore
-
+from tests import concurrency
 
 
 def test_connection_pool_with_keepalive():
@@ -835,3 +835,40 @@ def test_http11_upgrade_connection():
         "http11.response_closed.started",
         "http11.response_closed.complete",
     ]
+
+
+def test_connection_pool_idle_cleanup_is_linear():
+    # Large pools must not scan all connections for each surplus idle one.
+    pool = httpcore.ConnectionPool(max_connections=100, max_keepalive_connections=25)
+    connections = [Mock() for _ in range(50)]
+    for connection in connections:
+        connection.is_closed.return_value = False
+        connection.has_expired.return_value = False
+        connection.is_idle.return_value = True
+    pool._connections = list(connections)
+
+    closing = pool._assign_requests_to_connections()
+
+    assert len(pool.connections) == 25
+    assert closing == connections[:25]
+    assert sum(c.is_idle.call_count for c in connections) <= len(connections) * 2
+
+
+def test_connection_pool_cleanup_keeps_active_and_retires_expired():
+    pool = httpcore.ConnectionPool(max_connections=10, max_keepalive_connections=1)
+    connections = [Mock() for _ in range(5)]
+    for connection in connections:
+        connection.is_closed.return_value = False
+        connection.has_expired.return_value = False
+        connection.is_idle.return_value = False
+    connections[0].is_idle.return_value = True  # expired idle
+    connections[0].has_expired.return_value = True
+    connections[1].is_idle.return_value = True  # extra idle
+    connections[2].is_idle.return_value = True  # healthy idle
+    connections[3].is_closed.return_value = True
+    pool._connections = list(connections)
+
+    closing = pool._assign_requests_to_connections()
+
+    assert closing == [connections[0], connections[1]]
+    assert pool.connections == [connections[2], connections[4]]
