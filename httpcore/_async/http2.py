@@ -297,10 +297,17 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         Send a single chunk of data in one or more data frames.
         """
         while data:
-            max_flow = await self._wait_for_outgoing_flow(request, stream_id)
-            chunk_size = min(len(data), max_flow)
-            chunk, data = data[:chunk_size], data[chunk_size:]
+            await self._wait_for_outgoing_flow(request, stream_id)
             with self._h2_thread_lock:
+                # Credit may have been spent by another stream while we waited.
+                max_flow = min(
+                    self._h2_state.local_flow_control_window(stream_id),
+                    self._h2_state.max_outbound_frame_size,
+                )
+                if max_flow <= 0:
+                    continue
+                chunk_size = min(len(data), max_flow)
+                chunk, data = data[:chunk_size], data[chunk_size:]
                 self._h2_state.send_data(stream_id, chunk)
             await self._write_outgoing_data(request)
 
@@ -521,7 +528,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
         """
         Returns the maximum allowable outgoing flow for a given stream.
 
-        If the allowable flow is zero, then waits on the network until
+        If the allowable flow is non-positive, then waits on the network until
         WindowUpdated frames have increased the flow rate.
         https://tools.ietf.org/html/rfc7540#section-6.9
         """
@@ -529,7 +536,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             local_flow: int = self._h2_state.local_flow_control_window(stream_id)
             max_frame_size: int = self._h2_state.max_outbound_frame_size
         flow = min(local_flow, max_frame_size)
-        while flow == 0:
+        while flow <= 0:
             await self._receive_events(request)
             with self._h2_thread_lock:
                 local_flow = self._h2_state.local_flow_control_window(stream_id)
