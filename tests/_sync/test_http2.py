@@ -409,3 +409,90 @@ def test_http2_concurrent_send_request_headers() -> None:
     with concurrency.open_nursery() as nursery:
         for i in range(10):
             nursery.start_soon(send_headers, i)
+
+
+def test_http2_concurrent_body_flow_control_credit():
+    """Two uploads must not both spend the same connection flow-control credit."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    from unittest import mock
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.WindowUpdateFrame(
+                stream_id=0, window_increment=512
+            ).serialize(),
+        ]
+    )
+    conn = httpcore.HTTP2Connection(origin=origin, stream=stream)
+    conn._h2_state.initiate_connection()
+    requests = [
+        httpcore.Request(
+            "POST",
+            f"https://example.com/{i}",
+            headers={b"host": b"example.com", b"content-length": b"200"},
+            content=b"x" * 200,
+        )
+        for i in range(3)
+    ]
+    stream_ids = [conn._send_request_headers(request) for request in requests]
+
+    remaining = 65535 - 256
+    while remaining:
+        amount = min(16384, remaining)
+        conn._h2_state.send_data(stream_ids[0], b"x" * amount)
+        remaining -= amount
+
+    original_wait = conn._wait_for_outgoing_flow
+    race = Barrier(2, timeout=5)
+
+    def synchronize_credit_read(request, stream_id):
+        flow = original_wait(request, stream_id)
+        if flow == 256:
+            race.wait()
+        return flow
+
+    sent = {stream_id: 0 for stream_id in stream_ids[1:]}
+    original_send_data = conn._h2_state.send_data
+
+    def track_send(stream_id, data, *args, **kwargs):
+        original_send_data(stream_id, data, *args, **kwargs)
+        if stream_id in sent:
+            sent[stream_id] += len(data)
+
+    def upload(index):
+        conn._send_stream_data(requests[index], stream_ids[index], b"x" * 200)
+
+    with mock.patch.object(conn, "_wait_for_outgoing_flow", synchronize_credit_read):
+        with mock.patch.object(conn._h2_state, "send_data", track_send):
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                list(workers.map(upload, (1, 2)))
+    assert sent == {stream_ids[1]: 200, stream_ids[2]: 200}
+
+
+def test_http2_wait_for_negative_body_flow_control_credit():
+    import h2.settings
+
+    settings = hyperframe.frame.SettingsFrame()
+    settings.settings[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE] = 200
+    update = hyperframe.frame.WindowUpdateFrame(stream_id=1, window_increment=1000)
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream([settings.serialize(), update.serialize()])
+    conn = httpcore.HTTP2Connection(origin=origin, stream=stream)
+    conn._h2_state.initiate_connection()
+    request = httpcore.Request(
+        "POST",
+        "https://example.com/",
+        headers={b"host": b"example.com", b"content-length": b"700"},
+        content=b"x" * 700,
+    )
+    stream_id = conn._send_request_headers(request)
+    conn._h2_state.send_data(stream_id, b"x" * 500)
+    conn._receive_events(request)
+    assert conn._h2_state.local_flow_control_window(stream_id) == -300
+
+    assert conn._wait_for_outgoing_flow(request, stream_id) == 700
+    conn._send_stream_data(request, stream_id, b"x" * 200)
+    assert conn._h2_state.local_flow_control_window(stream_id) == 500
