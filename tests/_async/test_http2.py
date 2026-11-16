@@ -409,3 +409,99 @@ async def test_http2_concurrent_send_request_headers() -> None:
     async with concurrency.open_nursery() as nursery:
         for i in range(10):
             nursery.start_soon(send_headers, i)
+
+
+@pytest.mark.anyio
+async def test_http2_concurrent_body_flow_control_credit():
+    """Concurrent async uploads must each receive actual flow-control credit."""
+    from unittest import mock
+
+    import anyio
+
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.WindowUpdateFrame(
+                stream_id=0, window_increment=512
+            ).serialize(),
+        ]
+    )
+    conn = httpcore.AsyncHTTP2Connection(origin=origin, stream=stream)
+    conn._h2_state.initiate_connection()
+    requests = [
+        httpcore.Request(
+            "POST",
+            f"https://example.com/{i}",
+            headers={b"host": b"example.com", b"content-length": b"200"},
+            content=b"x" * 200,
+        )
+        for i in range(3)
+    ]
+    stream_ids = [await conn._send_request_headers(request) for request in requests]
+
+    remaining = 65535 - 256
+    while remaining:
+        amount = min(16384, remaining)
+        conn._h2_state.send_data(stream_ids[0], b"x" * amount)
+        remaining -= amount
+
+    original_wait = conn._wait_for_outgoing_flow
+    rendezvous = anyio.Event()
+    arrivals = 0
+
+    async def synchronize_credit_read(request, stream_id):
+        nonlocal arrivals
+        flow = await original_wait(request, stream_id)
+        if flow == 256:
+            arrivals += 1
+            if arrivals == 2:
+                rendezvous.set()
+            await rendezvous.wait()
+        return flow
+
+    sent = {stream_id: 0 for stream_id in stream_ids[1:]}
+    original_send_data = conn._h2_state.send_data
+
+    def track_send(stream_id, data, *args, **kwargs):
+        original_send_data(stream_id, data, *args, **kwargs)
+        if stream_id in sent:
+            sent[stream_id] += len(data)
+
+    async def upload(index):
+        await conn._send_stream_data(requests[index], stream_ids[index], b"x" * 200)
+
+    with mock.patch.object(conn, "_wait_for_outgoing_flow", synchronize_credit_read):
+        with mock.patch.object(conn._h2_state, "send_data", track_send):
+            with anyio.fail_after(5):
+                async with anyio.create_task_group() as tasks:
+                    tasks.start_soon(upload, 1)
+                    tasks.start_soon(upload, 2)
+    assert sent == {stream_ids[1]: 200, stream_ids[2]: 200}
+
+
+@pytest.mark.anyio
+async def test_http2_wait_for_negative_body_flow_control_credit():
+    import h2.settings
+
+    settings = hyperframe.frame.SettingsFrame()
+    settings.settings[h2.settings.SettingCodes.INITIAL_WINDOW_SIZE] = 200
+    update = hyperframe.frame.WindowUpdateFrame(stream_id=1, window_increment=1000)
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.AsyncMockStream([settings.serialize(), update.serialize()])
+    conn = httpcore.AsyncHTTP2Connection(origin=origin, stream=stream)
+    conn._h2_state.initiate_connection()
+    request = httpcore.Request(
+        "POST",
+        "https://example.com/",
+        headers={b"host": b"example.com", b"content-length": b"700"},
+        content=b"x" * 700,
+    )
+    stream_id = await conn._send_request_headers(request)
+    conn._h2_state.send_data(stream_id, b"x" * 500)
+    await conn._receive_events(request)
+    assert conn._h2_state.local_flow_control_window(stream_id) == -300
+
+    assert await conn._wait_for_outgoing_flow(request, stream_id) == 700
+    await conn._send_stream_data(request, stream_id, b"x" * 200)
+    assert conn._h2_state.local_flow_control_window(stream_id) == 500
