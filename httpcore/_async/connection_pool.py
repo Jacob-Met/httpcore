@@ -292,7 +292,11 @@ class AsyncConnectionPool(AsyncRequestInterface):
         closing_connections = []
 
         # First we handle cleaning up any connections that are closed,
-        # have expired their keep-alive, or surplus idle connections.
+        # have expired their keep-alive, or surplus idle connections. Compute
+        # the idle state once, avoiding repeated whole-pool scans.
+        idle_set = {
+            connection for connection in self._connections if connection.is_idle()
+        }
         for connection in list(self._connections):
             if connection in self._retired_connections:
                 if not any(
@@ -300,22 +304,25 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 ):
                     self._connections.remove(connection)
                     self._retired_connections.remove(connection)
+                    idle_set.discard(connection)
                     closing_connections.append(connection)
                 continue
             if connection.is_closed():
                 # log: "removing closed connection"
                 self._connections.remove(connection)
+                idle_set.discard(connection)
             elif connection.has_expired():
                 # log: "closing expired connection"
                 self._connections.remove(connection)
+                idle_set.discard(connection)
                 closing_connections.append(connection)
             elif (
-                connection.is_idle()
-                and sum(connection.is_idle() for connection in self._connections)
-                > self._max_keepalive_connections
+                connection in idle_set
+                and len(idle_set) > self._max_keepalive_connections
             ):
                 # log: "closing idle connection"
                 self._connections.remove(connection)
+                idle_set.remove(connection)
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
