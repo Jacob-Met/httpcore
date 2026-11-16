@@ -872,3 +872,36 @@ def test_connection_pool_cleanup_keeps_active_and_retires_expired():
 
     assert closing == [connections[0], connections[1]]
     assert pool.connections == [connections[2], connections[4]]
+
+
+def test_idle_socket_probe_only_on_reuse():
+    """Only the socket to be reused needs a readability check."""
+    from httpcore._sync.connection_pool import PoolRequest
+
+    pool = httpcore.ConnectionPool(max_connections=20)
+    unrelated = []
+    for _ in range(10):
+        connection = Mock()
+        connection.is_idle.return_value = True
+        connection.is_closed.return_value = False
+        connection.has_expired.return_value = False
+        connection.is_available.return_value = True
+        connection.can_handle_request.return_value = False
+        unrelated.append(connection)
+
+    candidate = Mock()
+    candidate.is_idle.return_value = True
+    candidate.is_closed.return_value = False
+    candidate.has_expired.return_value = True
+    candidate.is_available.return_value = True
+    candidate.can_handle_request.return_value = True
+    pool._connections = [*unrelated, candidate]
+    pool_request = PoolRequest(httpcore.Request("GET", "http://example.com/"))
+    pool._requests.append(pool_request)
+    closing = pool._assign_requests_to_connections()
+
+    assert sum(connection.has_expired.call_count for connection in unrelated) <= 1
+    assert candidate.has_expired.call_count == 1
+    assert candidate in closing
+    assert candidate not in pool.connections
+    assert pool_request.connection is not candidate
