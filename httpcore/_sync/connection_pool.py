@@ -120,6 +120,7 @@ class ConnectionPool(RequestInterface):
         self._connections: list[ConnectionInterface] = []
         self._requests: list[PoolRequest] = []
         self._retired_connections: set[ConnectionInterface] = set()
+        self._idle_probe_index = 0
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -297,6 +298,18 @@ class ConnectionPool(RequestInterface):
         idle_set = {
             connection for connection in self._connections if connection.is_idle()
         }
+        # Gradually reclaim expired sockets from unrelated origins rather than
+        # probing every idle socket for each request. Revalidate a candidate
+        # immediately before reuse regardless of this background sweep.
+        idle_candidates = [
+            connection for connection in self._connections
+            if connection in idle_set and connection not in self._retired_connections
+        ]
+        idle_probe = None
+        if idle_candidates:
+            index = self._idle_probe_index % len(idle_candidates)
+            idle_probe = idle_candidates[index]
+            self._idle_probe_index = index + 1
         for connection in list(self._connections):
             if connection in self._retired_connections:
                 if not any(
@@ -311,8 +324,12 @@ class ConnectionPool(RequestInterface):
                 # log: "removing closed connection"
                 self._connections.remove(connection)
                 idle_set.discard(connection)
-            elif connection.has_expired():
-                # log: "closing expired connection"
+            elif (
+                connection in idle_set
+                and (self._keepalive_expiry == 0 or connection is idle_probe)
+                and connection.has_expired()
+            ):
+                # Close expired or server-disconnected idle connections.
                 self._connections.remove(connection)
                 idle_set.discard(connection)
                 closing_connections.append(connection)
@@ -336,6 +353,18 @@ class ConnectionPool(RequestInterface):
                 and connection.can_handle_request(origin)
                 and connection.is_available()
             ]
+            # Socket readability probing is expensive. Only probe an idle
+            # connection when it is about to be reused, rather than probing
+            # every unrelated idle socket on every request/pool update.
+            while available_connections:
+                connection = available_connections[0]
+                if not connection.is_idle() or not connection.has_expired():
+                    break
+                available_connections.pop(0)
+                self._connections.remove(connection)
+                idle_set.discard(connection)
+                closing_connections.append(connection)
+
             idle_connections = [
                 connection
                 for connection in self._connections
