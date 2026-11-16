@@ -119,6 +119,7 @@ class ConnectionPool(RequestInterface):
         # and the set of connections that are servicing those requests.
         self._connections: list[ConnectionInterface] = []
         self._requests: list[PoolRequest] = []
+        self._retired_connections: set[ConnectionInterface] = set()
 
         # We only mutate the state of the connection pool within an 'optional_thread_lock'
         # context. This holds a threading lock unless we're running in async mode,
@@ -241,7 +242,18 @@ class ConnectionPool(RequestInterface):
                     # handle a request, but then become unavailable.
                     #
                     # In this case we clear the connection and try again.
-                    pool_request.clear_connection()
+                    # Retire persistently unavailable connections without
+                    # disrupting another request that is still using them.
+                    with self._optional_thread_lock:
+                        pool_request.clear_connection()
+                        still_in_use = any(
+                            request.connection is connection
+                            for request in self._requests
+                        )
+                        if connection in self._connections and (
+                            connection.is_available() or not still_in_use
+                        ):
+                            self._retired_connections.add(connection)
                 else:
                     break  # pragma: nocover
 
@@ -282,6 +294,14 @@ class ConnectionPool(RequestInterface):
         # First we handle cleaning up any connections that are closed,
         # have expired their keep-alive, or surplus idle connections.
         for connection in list(self._connections):
+            if connection in self._retired_connections:
+                if not any(
+                    request.connection is connection for request in self._requests
+                ):
+                    self._connections.remove(connection)
+                    self._retired_connections.remove(connection)
+                    closing_connections.append(connection)
+                continue
             if connection.is_closed():
                 # log: "removing closed connection"
                 self._connections.remove(connection)
@@ -305,10 +325,14 @@ class ConnectionPool(RequestInterface):
             available_connections = [
                 connection
                 for connection in self._connections
-                if connection.can_handle_request(origin) and connection.is_available()
+                if connection not in self._retired_connections
+                and connection.can_handle_request(origin)
+                and connection.is_available()
             ]
             idle_connections = [
-                connection for connection in self._connections if connection.is_idle()
+                connection
+                for connection in self._connections
+                if connection not in self._retired_connections and connection.is_idle()
             ]
 
             # There are three cases for how we may be able to handle the request:
@@ -350,6 +374,7 @@ class ConnectionPool(RequestInterface):
         with self._optional_thread_lock:
             closing_connections = list(self._connections)
             self._connections = []
+            self._retired_connections.clear()
         self._close_connections(closing_connections)
 
     def __enter__(self) -> ConnectionPool:
