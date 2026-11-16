@@ -317,6 +317,9 @@ class AsyncSocks5Connection(AsyncConnectionInterface):
             )
         return self._connection.is_available()
 
+    def is_multiplexing(self) -> bool:
+        return self._connection is not None and self._connection.is_multiplexing()
+
     def has_expired(self) -> bool:
         if self._connection is None:  # pragma: nocover
             return self._connect_failed

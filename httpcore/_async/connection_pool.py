@@ -345,6 +345,10 @@ class AsyncConnectionPool(AsyncRequestInterface):
 
         # Assign queued requests to connections.
         queued_requests = [request for request in self._requests if request.is_queued()]
+        assigned_connections = {
+            request.connection for request in self._requests
+            if request.connection is not None
+        }
         for pool_request in queued_requests:
             origin = pool_request.request.url.origin
             available_connections = [
@@ -353,6 +357,11 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 if connection not in self._retired_connections
                 and connection.can_handle_request(origin)
                 and connection.is_available()
+                and (
+                    connection not in assigned_connections
+                    or not connection.is_idle()
+                    or connection.is_multiplexing()
+                )
             ]
             # Socket readability probing is expensive. Only probe an idle
             # connection when it is about to be reused, rather than probing
@@ -382,6 +391,7 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "reusing existing connection"
                 connection = available_connections[0]
                 pool_request.assign_to_connection(connection)
+                assigned_connections.add(connection)
             elif len(self._connections) < self._max_connections:
                 # log: "creating new connection"
                 connection = self.create_connection(origin)
