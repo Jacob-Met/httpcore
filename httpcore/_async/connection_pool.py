@@ -311,6 +311,14 @@ class AsyncConnectionPool(AsyncRequestInterface):
             index = self._idle_probe_index % len(idle_candidates)
             idle_probe = idle_candidates[index]
             self._idle_probe_index = index + 1
+        # An assigned connection can be neither idle nor available while its
+        # request is establishing it. A cancellation between assignment and
+        # dispatch otherwise strands that connection in CONNECTING forever.
+        assigned_connection_ids = {
+            id(request.connection)
+            for request in self._requests
+            if request.connection is not None
+        }
         for connection in list(self._connections):
             if connection in self._retired_connections:
                 if not any(
@@ -341,6 +349,15 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 # log: "closing idle connection"
                 self._connections.remove(connection)
                 idle_set.remove(connection)
+                closing_connections.append(connection)
+            elif (
+                id(connection) not in assigned_connection_ids
+                and not connection.is_available()
+                and not connection.is_idle()
+            ):
+                # Reclaim an orphaned connecting connection; no live request
+                # can finish establishing it or make it available again.
+                self._connections.remove(connection)
                 closing_connections.append(connection)
 
         # Assign queued requests to connections.
