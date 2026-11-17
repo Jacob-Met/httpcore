@@ -243,3 +243,63 @@ async def test_h2_timeout_during_response():
 
         assert not conn.is_closed()
         assert conn.is_idle()
+
+
+@pytest.mark.anyio
+async def test_http2_cancelled_request_releases_outbound_stream():
+    """Cancelling a waiting request must free the peer's H2 stream slot."""
+
+    class PausedResponseStream(httpcore.AsyncMockStream):
+        def __init__(self) -> None:
+            super().__init__([hyperframe.frame.SettingsFrame().serialize()])
+            self.waiting = anyio.Event()
+
+        async def read(
+            self, max_bytes: int, timeout: typing.Optional[float] = None
+        ) -> bytes:
+            if self._buffer:
+                return await super().read(max_bytes, timeout)
+            self.waiting.set()
+            await anyio.sleep_forever()
+            raise AssertionError("unreachable")
+
+    stream = PausedResponseStream()
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(conn.request, "GET", "https://example.com/")
+            with anyio.fail_after(5):
+                await stream.waiting.wait()
+            assert conn._h2_state.open_outbound_streams == 1
+            tg.cancel_scope.cancel()
+        assert conn._h2_state.open_outbound_streams == 0
+
+
+@pytest.mark.anyio
+async def test_http2_cancelled_write_disables_connection_reuse():
+    """Cancelling socket writes can discard queued frames; no reuse is safe."""
+
+    class PausedWriteStream(httpcore.AsyncMockStream):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.writing = anyio.Event()
+            self.writes = 0
+
+        async def write(
+            self, buffer: bytes, timeout: typing.Optional[float] = None
+        ) -> None:
+            self.writes += 1
+            if self.writes == 2:
+                self.writing.set()
+                await anyio.sleep_forever()
+
+    stream = PausedWriteStream()
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    async with httpcore.AsyncHTTP2Connection(origin=origin, stream=stream) as conn:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(conn.request, "GET", "https://example.com/")
+            with anyio.fail_after(5):
+                await stream.writing.wait()
+            tg.cancel_scope.cancel()
+        assert not conn.is_available()
+        assert not conn._events

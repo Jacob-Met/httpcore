@@ -380,3 +380,24 @@ def test_http2_remote_max_streams_update():
                         conn._h2_state.local_settings.max_concurrent_streams,
                     )
                 i += 1
+
+
+
+def test_http2_early_response_close_frees_outbound_stream():
+    """Closing a partial response must notify h2 before reusing the slot."""
+    origin = httpcore.Origin(b"https", b"example.com", 443)
+    stream = httpcore.MockStream(
+        [
+            hyperframe.frame.SettingsFrame().serialize(),
+            hyperframe.frame.HeadersFrame(
+                stream_id=1,
+                data=hpack.Encoder().encode([(b":status", b"200")]),
+                flags=["END_HEADERS"],
+            ).serialize(),
+        ]
+    )
+    with httpcore.HTTP2Connection(origin=origin, stream=stream) as conn:
+        with conn.stream("GET", "https://example.com/") as response:
+            assert response.status == 200
+            assert conn._h2_state.open_outbound_streams == 1
+        assert conn._h2_state.open_outbound_streams == 0

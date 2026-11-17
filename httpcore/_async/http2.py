@@ -166,7 +166,7 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
             with AsyncShieldCancellation():
                 kwargs = {"stream_id": stream_id}
                 async with Trace("response_closed", logger, request, kwargs):
-                    await self._response_closed(stream_id=stream_id)
+                    await self._response_closed(stream_id=stream_id, request=request)
 
             if isinstance(exc, h2.exceptions.ProtocolError):
                 # One case where h2 can raise a protocol error is when a
@@ -406,20 +406,39 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
                     await self._max_streams_semaphore.acquire()
                     self._max_streams -= 1
 
-    async def _response_closed(self, stream_id: int) -> None:
-        await self._max_streams_semaphore.release()
-        del self._events[stream_id]
-        async with self._state_lock:
-            if self._connection_terminated and not self._events:
-                await self.aclose()
+    async def _response_closed(self, stream_id: int, request: Request) -> None:
+        try:
+            # A request can be cancelled before the peer closes its stream.
+            # Releasing our semaphore alone would let a new request exceed
+            # h2's stream limit, eventually raising TooManyStreamsError.
+            stream = self._h2_state.streams.get(stream_id)
+            if (
+                not self._connection_error
+                and self._connection_terminated is None
+                and self._h2_state.state_machine.state
+                != h2.connection.ConnectionState.CLOSED
+                and stream is not None
+                and not stream.closed
+            ):
+                self._h2_state.reset_stream(stream_id)
+                await self._write_outgoing_data(request)
+        finally:
+            # Even if sending the reset fails, the connection is no longer
+            # reusable and must not retain slots or event bookkeeping.
+            with AsyncShieldCancellation():
+                await self._max_streams_semaphore.release()
+                del self._events[stream_id]
+                async with self._state_lock:
+                    if self._connection_terminated and not self._events:
+                        await self.aclose()
 
-            elif self._state == HTTPConnectionState.ACTIVE and not self._events:
-                self._state = HTTPConnectionState.IDLE
-                if self._keepalive_expiry is not None:
-                    now = time.monotonic()
-                    self._expire_at = now + self._keepalive_expiry
-                if self._used_all_stream_ids:  # pragma: nocover
-                    await self.aclose()
+                    elif self._state == HTTPConnectionState.ACTIVE and not self._events:
+                        self._state = HTTPConnectionState.IDLE
+                        if self._keepalive_expiry is not None:
+                            now = time.monotonic()
+                            self._expire_at = now + self._keepalive_expiry
+                        if self._used_all_stream_ids:  # pragma: nocover
+                            await self.aclose()
 
     async def aclose(self) -> None:
         # Note that this method unilaterally closes the connection, and does
@@ -470,18 +489,13 @@ class AsyncHTTP2Connection(AsyncConnectionInterface):
 
             try:
                 await self._network_stream.write(data_to_send, timeout)
-            except Exception as exc:  # pragma: nocover
-                # If we get a network error we should:
-                #
-                # 1. Save the exception and just raise it immediately on any future write.
-                #    (For example, this means that a single write timeout or disconnect will
-                #    immediately close all pending streams. Without requiring multiple
-                #    sequential timeouts.)
-                # 2. Mark the connection as errored, so that we don't accept any other
-                #    incoming requests.
-                self._write_exception = exc
+            except BaseException as exc:  # noqa: PIE786
+                # Cancellation after data_to_send() has consumed pending frames
+                # also makes the wire state uncertain. Do not reuse the connection.
+                if isinstance(exc, Exception):
+                    self._write_exception = exc
                 self._connection_error = True
-                raise exc
+                raise
 
     # Flow control...
 
@@ -589,4 +603,6 @@ class HTTP2ConnectionByteStream:
             self._closed = True
             kwargs = {"stream_id": self._stream_id}
             async with Trace("response_closed", logger, self._request, kwargs):
-                await self._connection._response_closed(stream_id=self._stream_id)
+                await self._connection._response_closed(
+                    stream_id=self._stream_id, request=self._request
+                )
