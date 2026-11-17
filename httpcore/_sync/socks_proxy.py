@@ -12,6 +12,7 @@ from .._models import URL, Origin, Request, Response, enforce_bytes, enforce_url
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
+from .._utils import normalize_sni_hostname
 from .connection_pool import ConnectionPool
 from .http11 import HTTP11Connection
 from .interfaces import ConnectionInterface
@@ -258,8 +259,9 @@ class Socks5Connection(ConnectionInterface):
 
                         kwargs = {
                             "ssl_context": ssl_context,
-                            "server_hostname": sni_hostname
-                            or self._remote_origin.host.decode("ascii"),
+                            "server_hostname": normalize_sni_hostname(
+                                sni_hostname or self._remote_origin.host.decode("ascii")
+                            ),
                             "timeout": timeout,
                         }
                         with Trace("start_tls", logger, request, kwargs) as trace:

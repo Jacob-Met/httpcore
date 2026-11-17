@@ -5,6 +5,14 @@ import socket
 import sys
 
 
+def normalize_sni_hostname(hostname: str) -> str:
+    """
+    TLS SNI uses the DNS hostname without the absolute-name root dot (RFC 6066).
+    DNS lookup and HTTP authority must continue to use the original hostname.
+    """
+    return hostname[:-1] if hostname.endswith(".") else hostname
+
+
 def is_socket_readable(sock: socket.socket | None) -> bool:
     """
     Return whether a socket, as identifed by its file descriptor, is readable.

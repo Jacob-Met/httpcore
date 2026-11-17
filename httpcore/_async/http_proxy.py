@@ -19,6 +19,7 @@ from .._models import (
 from .._ssl import default_ssl_context
 from .._synchronization import AsyncLock
 from .._trace import Trace
+from .._utils import normalize_sni_hostname
 from .connection import AsyncHTTPConnection
 from .connection_pool import AsyncConnectionPool
 from .http11 import AsyncHTTP11Connection
@@ -309,7 +310,9 @@ class AsyncTunnelHTTPConnection(AsyncConnectionInterface):
 
                 kwargs = {
                     "ssl_context": ssl_context,
-                    "server_hostname": self._remote_origin.host.decode("ascii"),
+                    "server_hostname": normalize_sni_hostname(
+                        self._remote_origin.host.decode("ascii")
+                    ),
                     "timeout": timeout,
                 }
                 async with Trace("start_tls", logger, request, kwargs) as trace:

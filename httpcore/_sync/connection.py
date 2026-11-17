@@ -13,6 +13,7 @@ from .._models import Origin, Request, Response
 from .._ssl import default_ssl_context
 from .._synchronization import Lock
 from .._trace import Trace
+from .._utils import normalize_sni_hostname
 from .http11 import HTTP11Connection
 from .interfaces import ConnectionInterface
 
@@ -148,8 +149,9 @@ class HTTPConnection(ConnectionInterface):
 
                     kwargs = {
                         "ssl_context": ssl_context,
-                        "server_hostname": sni_hostname
-                        or self._origin.host.decode("ascii"),
+                        "server_hostname": normalize_sni_hostname(
+                            sni_hostname or self._origin.host.decode("ascii")
+                        ),
                         "timeout": timeout,
                     }
                     with Trace("start_tls", logger, request, kwargs) as trace:
