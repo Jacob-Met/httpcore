@@ -298,6 +298,16 @@ class AsyncConnectionPool(AsyncRequestInterface):
                 self._connections.remove(connection)
                 closing_connections.append(connection)
 
+        # If every connection is busy, no queued request can acquire a slot.
+        # Avoid searching the growing request queue for matches on each arrival;
+        # the connection release/cancellation path will re-run this assignment.
+        # Do this after cleanup so orphaned or closed connections free capacity.
+        if len(self._connections) >= self._max_connections and not any(
+            connection.is_available() or connection.is_idle()
+            for connection in self._connections
+        ):
+            return closing_connections
+
         # Assign queued requests to connections.
         queued_requests = [request for request in self._requests if request.is_queued()]
         for pool_request in queued_requests:
